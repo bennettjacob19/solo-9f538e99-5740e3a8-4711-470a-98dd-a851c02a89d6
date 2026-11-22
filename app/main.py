@@ -52,6 +52,7 @@ class VersionResponse(BaseModel):
     image_size: int
     block_count: int
     sha256: str
+    data_files: int = Field(..., description="当前版这批写块占用的数据文件数（合并布局为 1，纯丢弃为 0）")
 
 
 class CommitResponse(BaseModel):
@@ -60,6 +61,7 @@ class CommitResponse(BaseModel):
     sha256: str
     image_size: int
     block_count: int
+    data_files: int
 
 
 @asynccontextmanager
@@ -108,6 +110,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
             image_size=state.image_size,
             block_count=state.block_count,
             sha256=state.sha256,
+            data_files=state.data_files,
         )
 
     @app.post(
@@ -133,6 +136,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
             sha256=state.sha256,
             image_size=state.image_size,
             block_count=state.block_count,
+            data_files=state.data_files,
         )
 
     @app.get("/image", tags=["镜像"], summary="流式下载当前 raw 镜像")

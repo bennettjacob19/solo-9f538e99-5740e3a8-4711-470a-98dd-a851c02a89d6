@@ -35,7 +35,42 @@ def test_health_and_version(client, image_size):
     assert body["version"] == 1
     assert body["image_size"] == image_size
     assert body["block_count"] == 11
+    assert body["data_files"] == 0  # 基线没有写块数据文件
     assert len(body["sha256"]) == 64
+
+
+def test_version_reports_data_files(client):
+    """/version 显示当前版这批写块占用的数据文件数。"""
+    store = client.app.state.store
+
+    # 写批次：本批写块合并为 1 个数据文件
+    target = _with_block(_current_image(store), 1, b"\x01" * BLOCK_SIZE)
+    r = client.post(
+        "/recover/commit",
+        json={
+            "parent_version": 1,
+            "target_sha256": sha256_hex(target),
+            "changes": [{"index": 1, "op": "write", "data_base64": _b64(b"\x01" * BLOCK_SIZE)}],
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["data_files"] == 1
+    assert client.get("/version").json()["data_files"] == 1
+
+    # 纯丢弃批次：不产生数据文件
+    image = bytearray(target)
+    image[0:BLOCK_SIZE] = b"\x00" * BLOCK_SIZE
+    r = client.post(
+        "/recover/commit",
+        json={
+            "parent_version": 2,
+            "target_sha256": sha256_hex(bytes(image)),
+            "changes": [{"index": 0, "op": "discard"}],
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["data_files"] == 0
+    assert client.get("/version").json()["data_files"] == 0
 
 
 def test_commit_endpoint_full_flow(client, image_size):

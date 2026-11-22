@@ -1,4 +1,4 @@
-"""存储核心：链式版本、丢弃块、失败回滚、崩溃对账、只落盘变动块。"""
+"""存储核心：链式版本、丢弃块、失败回滚、崩溃对账、合并数据文件布局。"""
 
 import base64
 import json
@@ -6,13 +6,62 @@ import os
 
 import pytest
 
-from app.storage import BLOCK_SIZE, BlockStore, ConflictError, StorageError
+from app.storage import BLOCK_SIZE, BlockStore, ConflictError, StorageError, atomic_write_json
 
 from .conftest import expected_image, sha256_hex
 
 
 def write_change(index: int, data: bytes) -> dict:
     return {"index": index, "op": "write", "data_base64": base64.b64encode(data).decode("ascii")}
+
+
+def write_legacy_version(
+    data_dir,
+    version: int,
+    parent_version: int,
+    image_size: int,
+    base_image: bytes,
+    writes: dict[int, bytes],
+    discards: tuple[int, ...] = (),
+) -> bytes:
+    """按旧布局手工落盘一个版本（每块一个独立文件 + 旧格式 meta + current 指针）。
+
+    用于模拟新代码打开旧数据卷的场景；返回该版对应的整盘镜像内容。
+    """
+    block_count = (image_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+    image = bytearray(base_image)
+    changes: list[dict] = []
+    for index in sorted(writes):
+        data = writes[index]
+        (data_dir / "blocks" / f"b{index:010d}_v{version:06d}").write_bytes(data)
+        changes.append({"index": index, "op": "write"})
+        start = index * BLOCK_SIZE
+        image[start : start + len(data)] = data
+    for index in discards:
+        changes.append({"index": index, "op": "discard"})
+        start = index * BLOCK_SIZE
+        length = min(BLOCK_SIZE, image_size - start)
+        image[start : start + length] = b"\x00" * length
+    changes.sort(key=lambda c: c["index"])
+    meta = {
+        "version": version,
+        "parent_version": parent_version,
+        "image_size": image_size,
+        "block_count": block_count,
+        "changes": changes,
+        "sha256": sha256_hex(bytes(image)),
+    }
+    atomic_write_json(data_dir / f"v{version:06d}" / "meta.json", meta)
+    atomic_write_json(
+        data_dir / "current.json",
+        {
+            "version": version,
+            "image_size": image_size,
+            "block_count": block_count,
+            "sha256": meta["sha256"],
+        },
+    )
+    return bytes(image)
 
 
 def test_baseline_initialized(store, image_size):
@@ -138,8 +187,9 @@ def test_hash_mismatch_keeps_original(store, image_size):
     # 版本指针、镜像内容均保持原样
     assert store.current.version == current_version
     assert b"".join(store.iter_image()) == before
-    # 失败批次的块文件不得残留
+    # 失败批次的块数据不得残留（新旧布局目录都干净）
     assert os.listdir(store.root / "blocks") == []
+    assert not (store.root / "v000002").exists()
     # 暂存目录被清理
     assert not (store.root / "tmp" / "v000002").exists()
 
@@ -184,16 +234,108 @@ def test_only_changed_blocks_land_on_disk(store, image_size):
         changes=[write_change(4, data)],
         expected_sha256=sha256_hex(image),
     )
-    blocks_dir = store.root / "blocks"
-    files = sorted(os.listdir(blocks_dir))
-    # 只落盘 1 个变动块文件（4 KiB），没有整盘副本
-    assert files == ["b0000000004_v000002"]
-    assert os.path.getsize(blocks_dir / files[0]) == BLOCK_SIZE
+    # 只落盘 1 个合并数据文件（4 KiB），没有整盘副本，也不产生旧布局块文件
+    data_path = store.root / "v000002" / "data.bin"
+    assert data_path.read_bytes() == data
+    assert os.listdir(store.root / "blocks") == []
     meta = json.loads((store.root / "v000002" / "meta.json").read_text())
-    assert meta["changes"] == [{"index": 4, "op": "write"}]
+    assert meta["changes"] == [{"index": 4, "op": "write", "offset": 0, "length": BLOCK_SIZE}]
+    assert meta["data_file"] == "data.bin"
+    assert meta["data_size"] == BLOCK_SIZE
     assert meta["parent_version"] == 1
     # 基线文件大小不变
     assert os.path.getsize(store.baseline_path) == image_size
+
+
+def test_writes_merged_into_single_data_file(store):
+    """一批多个写块合并落盘为单个数据文件，meta 记录每块在文件内的偏移。"""
+    payloads = {i: bytes([0x10 + i]) * BLOCK_SIZE for i in (1, 4, 9)}
+    image = expected_image(store, payloads)
+    state = store.commit(
+        parent_version=1,
+        changes=[write_change(i, payloads[i]) for i in (9, 1, 4)],  # 乱序提交也应按块号落盘
+        expected_sha256=sha256_hex(image),
+    )
+    assert state.data_files == 1
+    # 数据文件内容按块号升序紧密拼接
+    data_path = store.root / "v000002" / "data.bin"
+    assert data_path.read_bytes() == payloads[1] + payloads[4] + payloads[9]
+    assert os.listdir(store.root / "blocks") == []
+    meta = json.loads((store.root / "v000002" / "meta.json").read_text())
+    assert meta["data_file"] == "data.bin"
+    assert meta["data_size"] == 3 * BLOCK_SIZE
+    assert meta["changes"] == [
+        {"index": 1, "op": "write", "offset": 0, "length": BLOCK_SIZE},
+        {"index": 4, "op": "write", "offset": BLOCK_SIZE, "length": BLOCK_SIZE},
+        {"index": 9, "op": "write", "offset": 2 * BLOCK_SIZE, "length": BLOCK_SIZE},
+    ]
+    assert b"".join(store.iter_image()) == image
+
+
+def test_hundreds_of_writes_land_in_one_file(tmp_path):
+    """灾备场景：一批几百个写块只新增 1 个数据文件，而不是几百个小文件。"""
+    store = BlockStore(tmp_path / "data")
+    store.init_baseline(320 * BLOCK_SIZE)
+    payloads = {i: bytes([(i * 7) & 0xFF]) * BLOCK_SIZE for i in range(300)}
+    image = expected_image(store, payloads)
+    state = store.commit(
+        parent_version=1,
+        changes=[write_change(i, payloads[i]) for i in range(300)],
+        expected_sha256=sha256_hex(image),
+    )
+    assert state.data_files == 1
+    data_path = store.root / "v000002" / "data.bin"
+    assert data_path.stat().st_size == 300 * BLOCK_SIZE
+    # 数据卷只多出 1 个数据文件（外加 meta 与 current 指针）
+    assert os.listdir(store.root / "blocks") == []
+    assert b"".join(store.iter_image()) == image
+    store.close()
+
+
+def test_packed_layout_with_tail_block(store, image_size):
+    """末块（非整块）写入合并数据文件：按真实长度记录偏移并读回。"""
+    tail_index = store.current.block_count - 1
+    tail_len = image_size - tail_index * BLOCK_SIZE  # 777
+    head = b"\x01" * BLOCK_SIZE
+    tail = b"\x02" * tail_len
+    image = bytearray(expected_image(store))
+    image[0:BLOCK_SIZE] = head
+    image[tail_index * BLOCK_SIZE :] = tail
+    state = store.commit(
+        parent_version=1,
+        changes=[write_change(0, head), write_change(tail_index, tail)],
+        expected_sha256=sha256_hex(bytes(image)),
+    )
+    assert state.data_files == 1
+    # 数据文件按块号升序紧密拼接：整块 4096 + 末块 777
+    data_path = store.root / "v000002" / "data.bin"
+    assert data_path.stat().st_size == BLOCK_SIZE + tail_len
+    assert data_path.read_bytes() == head + tail
+    meta = json.loads((store.root / "v000002" / "meta.json").read_text())
+    assert meta["changes"] == [
+        {"index": 0, "op": "write", "offset": 0, "length": BLOCK_SIZE},
+        {"index": tail_index, "op": "write", "offset": BLOCK_SIZE, "length": tail_len},
+    ]
+    assert store.read_block(tail_index) == tail
+    assert b"".join(store.iter_image()) == bytes(image)
+
+
+def test_discard_only_batch_skips_data_file(store):
+    """纯丢弃批次不产生数据文件。"""
+    image = bytearray(expected_image(store))
+    image[0:BLOCK_SIZE] = b"\x00" * BLOCK_SIZE
+    state = store.commit(
+        parent_version=1,
+        changes=[{"index": 0, "op": "discard"}],
+        expected_sha256=sha256_hex(bytes(image)),
+    )
+    assert state.data_files == 0
+    assert not (store.root / "v000002" / "data.bin").exists()
+    meta = json.loads((store.root / "v000002" / "meta.json").read_text())
+    assert meta["data_file"] is None
+    assert meta["data_size"] == 0
+    assert meta["changes"] == [{"index": 0, "op": "discard"}]
+    assert b"".join(store.iter_image()) == bytes(image)
 
 
 def test_restart_serves_last_complete_commit(tmp_path, image_size):
@@ -232,6 +374,77 @@ def test_restart_serves_last_complete_commit(tmp_path, image_size):
 
 
 def test_restart_with_missing_block_file(tmp_path, image_size):
+    """旧布局：缺块文件的版本在重启对账时被截断，回退到最后完整版本。"""
+    data_dir = tmp_path / "data"
+    s1 = BlockStore(data_dir)
+    s1.init_baseline(image_size)
+    s1.close()
+    base_image = (data_dir / "baseline.raw").read_bytes()
+    write_legacy_version(data_dir, 2, 1, image_size, base_image, {0: b"\x33" * BLOCK_SIZE})
+    # 人为损坏旧布局 v2：删掉它的块文件
+    os.remove(data_dir / "blocks" / "b0000000000_v000002")
+
+    s2 = BlockStore(data_dir)
+    state = s2.open()
+    # v2 不完整 → 回退到完整的基线 v1
+    assert state.version == 1
+    assert state.data_files == 0
+    assert b"".join(s2.iter_image()) == base_image
+    s2.close()
+
+
+def test_mixed_legacy_and_packed_layout(tmp_path, image_size):
+    """旧数据卷原样保留，可直接用新布局续写；同一镜像混读两种布局的块。"""
+    data_dir = tmp_path / "data"
+    boot = BlockStore(data_dir)
+    boot.init_baseline(image_size)
+    boot.close()
+    base_image = (data_dir / "baseline.raw").read_bytes()
+
+    # 手工构造旧布局 v2：块 2 以逐块文件形式落盘
+    legacy_data = bytes((i * 3) & 0xFF for i in range(BLOCK_SIZE))
+    image_v2 = write_legacy_version(data_dir, 2, 1, image_size, base_image, {2: legacy_data})
+
+    store = BlockStore(data_dir)
+    state = store.open()
+    assert state.version == 2
+    assert state.data_files == 1  # 旧布局：1 个写块 = 1 个块文件
+    assert store.read_block(2) == legacy_data
+    assert b"".join(store.iter_image()) == image_v2
+
+    # 新布局续写 v3：覆盖块 5、丢弃块 7
+    new_data = b"\xab" * BLOCK_SIZE
+    image_v3 = bytearray(image_v2)
+    image_v3[5 * BLOCK_SIZE : 6 * BLOCK_SIZE] = new_data
+    image_v3[7 * BLOCK_SIZE : 8 * BLOCK_SIZE] = b"\x00" * BLOCK_SIZE
+    image_v3 = bytes(image_v3)
+    state = store.commit(
+        parent_version=2,
+        changes=[write_change(5, new_data), {"index": 7, "op": "discard"}],
+        expected_sha256=sha256_hex(image_v3),
+    )
+    assert state.version == 3
+    assert state.data_files == 1  # 新布局：本批写块合并为 1 个 data.bin
+    # 混读：块 2 来自旧布局块文件，块 5 来自新布局 data.bin，块 7 读零
+    assert store.read_block(2) == legacy_data
+    assert store.read_block(5) == new_data
+    assert store.read_block(7) == b"\x00" * BLOCK_SIZE
+    assert b"".join(store.iter_image()) == image_v3
+    # 旧布局文件原样保留，新布局只新增 1 个数据文件
+    assert (data_dir / "blocks" / "b0000000002_v000002").read_bytes() == legacy_data
+    assert (data_dir / "v000003" / "data.bin").read_bytes() == new_data
+    store.close()
+
+    # 重启后混读依然正确
+    store2 = BlockStore(data_dir)
+    assert store2.open().version == 3
+    assert store2.read_block(2) == legacy_data
+    assert b"".join(store2.iter_image()) == image_v3
+    store2.close()
+
+
+def test_restart_with_missing_data_file(tmp_path, image_size):
+    """新布局数据文件缺失：重启回退到最后完整版本。"""
     data_dir = tmp_path / "data"
     s1 = BlockStore(data_dir)
     s1.init_baseline(image_size)
@@ -241,16 +454,65 @@ def test_restart_with_missing_block_file(tmp_path, image_size):
         changes=[write_change(0, b"\x33" * BLOCK_SIZE)],
         expected_sha256=sha256_hex(image_v2),
     )
-    # 人为损坏 v2：删掉它的块文件
-    os.remove(data_dir / "blocks" / "b0000000000_v000002")
     s1.close()
+    # 人为损坏新布局 v2：删掉合并数据文件
+    os.remove(data_dir / "v000002" / "data.bin")
 
     s2 = BlockStore(data_dir)
     state = s2.open()
-    # v2 不完整 → 回退到完整的基线 v1
     assert state.version == 1
-    assert b"".join(s2.iter_image()) == open(data_dir / "baseline.raw", "rb").read()
+    assert state.data_files == 0
+    assert b"".join(s2.iter_image()) == (data_dir / "baseline.raw").read_bytes()
     s2.close()
+
+
+def test_restart_with_truncated_data_file(tmp_path, image_size):
+    """新布局数据文件被截短：版号、文件数、下载内容回退，下一批从该版续提交。"""
+    data_dir = tmp_path / "data"
+    s1 = BlockStore(data_dir)
+    s1.init_baseline(image_size)
+    image_v2 = expected_image(s1, {0: b"\x33" * BLOCK_SIZE, 1: b"\x44" * BLOCK_SIZE})
+    s1.commit(
+        parent_version=1,
+        changes=[write_change(0, b"\x33" * BLOCK_SIZE), write_change(1, b"\x44" * BLOCK_SIZE)],
+        expected_sha256=sha256_hex(image_v2),
+    )
+    assert s1.current.data_files == 1
+    s1.close()
+    # 人为截短新布局数据文件（2 块数据砍掉一半）
+    data_path = data_dir / "v000002" / "data.bin"
+    assert data_path.stat().st_size == 2 * BLOCK_SIZE
+    with open(data_path, "r+b") as fh:
+        fh.truncate(BLOCK_SIZE)
+
+    s2 = BlockStore(data_dir)
+    state = s2.open()
+    # 版号、数据文件数、下载内容都回到最后完整的 v1
+    assert state.version == 1
+    assert state.data_files == 0
+    baseline = (data_dir / "baseline.raw").read_bytes()
+    assert b"".join(s2.iter_image()) == baseline
+    pointer = json.loads((data_dir / "current.json").read_text())
+    assert pointer["version"] == 1
+
+    # 同一版号可用新数据重试：v2 的截短残留被清理，续提交成功
+    image_v2b = expected_image(s2, {3: b"\x55" * BLOCK_SIZE})
+    state = s2.commit(
+        parent_version=1,
+        changes=[write_change(3, b"\x55" * BLOCK_SIZE)],
+        expected_sha256=sha256_hex(image_v2b),
+    )
+    assert state.version == 2
+    assert state.data_files == 1
+    assert b"".join(s2.iter_image()) == image_v2b
+    assert (data_dir / "v000002" / "data.bin").stat().st_size == BLOCK_SIZE
+    s2.close()
+
+    # 再次重启：续提交的 v2 完整可读
+    s3 = BlockStore(data_dir)
+    assert s3.open().version == 2
+    assert b"".join(s3.iter_image()) == image_v2b
+    s3.close()
 
 
 def test_init_baseline_is_idempotent(store, image_size):
@@ -264,7 +526,7 @@ def test_failed_commit_then_retry_same_version_succeeds(store):
     data = b"\x66" * BLOCK_SIZE
     target = expected_image(store, {0: data})
 
-    # 第一次：错误摘要失败（哈希过程会把块句柄放进缓存）
+    # 第一次：错误摘要失败（哈希过程会把数据文件句柄放进缓存）
     with pytest.raises(StorageError, match="摘要不吻合"):
         store.commit(
             parent_version=1,
@@ -273,6 +535,7 @@ def test_failed_commit_then_retry_same_version_succeeds(store):
         )
     assert store.current.version == 1
     assert os.listdir(store.root / "blocks") == []
+    assert not (store.root / "v000002").exists()
 
     # 第二次：正确摘要，版本号仍是 2，内容与摘要必须正确
     state = store.commit(
@@ -281,6 +544,7 @@ def test_failed_commit_then_retry_same_version_succeeds(store):
         expected_sha256=sha256_hex(target),
     )
     assert state.version == 2
+    assert state.data_files == 1
     assert store.read_block(0) == data
     assert b"".join(store.iter_image()) == target
 

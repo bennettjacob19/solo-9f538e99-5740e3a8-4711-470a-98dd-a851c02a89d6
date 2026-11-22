@@ -38,6 +38,7 @@ print("1) /docs 与 /openapi.json OK，接口:", sorted(openapi["paths"].keys())
 _, _, version = http("GET", "/version")
 print("2) 当前版本:", version)
 assert version["version"] == 1
+assert version["data_files"] == 0  # 基线没有写块数据文件
 
 # 3. 下载基线，核对摘要与长度
 _, headers, resp = http("GET", "/image", stream=True)
@@ -66,6 +67,7 @@ code, _, body = http(
     },
 )
 assert code == 201 and body["version"] == 2, body
+assert body["data_files"] == 1  # 本批写块合并为 1 个数据文件
 print("4) 提交 v2 成功:", body)
 
 # 5. 错误摘要 → 400，且版本不变
@@ -106,6 +108,7 @@ code, _, body = http(
     {"parent_version": 2, "target_sha256": target_sha, "changes": []},
 )
 assert code == 201 and body["version"] == 3
+assert body["data_files"] == 0  # 空批次没有写块，不产生数据文件
 print("8) 空变动批次发布 v3:", body)
 
 print("\n全部冒烟断言通过")
